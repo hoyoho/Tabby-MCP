@@ -1,5 +1,5 @@
 import { Injectable } from '@angular/core';
-import { AppService, SplitTabComponent, ConfigService } from 'tabby-core';
+import { AppService, SplitTabComponent as SplitTabComponentClass, ConfigService } from 'tabby-core';
 import { z } from 'zod';
 import { BehaviorSubject } from 'rxjs';
 import { BaseToolCategory } from './base-tool-category';
@@ -10,6 +10,12 @@ import { TerminalToolCategory } from './terminal';
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
+
+// Newer Tabby forks export SplitTabComponent as a value alias of the
+// workspace component rather than a class. Keep both a runtime value (for
+// `instanceof`) and a usable instance type (for casts/annotations).
+const SplitTabComponent = SplitTabComponentClass;
+type SplitTabComponent = InstanceType<typeof SplitTabComponentClass>;
 
 // Try to import tabby-ssh (optional dependency)
 let SSHTabComponent: any;
@@ -550,6 +556,20 @@ export class SFTPToolCategory extends BaseToolCategory {
                 createdAt: Date.now()
             });
             this.logger.info('[getSFTPSession] New SFTP session opened and cached');
+
+            // Newer forks expose a closed$ stream for the underlying SFTP
+            // channel; drop the cached entry as soon as it dies so the next
+            // operation reopens instead of reusing a dead channel.
+            if (sftpSession && typeof (sftpSession as any).closed$?.subscribe === 'function') {
+                let sub: { unsubscribe: () => void } | undefined;
+                sub = (sftpSession as any).closed$.subscribe(() => {
+                    const entry = this.sftpSessionCache.get(sshSession);
+                    if (entry?.sftpSession === sftpSession) {
+                        this.sftpSessionCache.delete(sshSession);
+                    }
+                    sub?.unsubscribe();
+                });
+            }
 
             // Cleanup old entries from disconnected sessions
             this.cleanupStaleSFTPSessions();
@@ -1199,7 +1219,7 @@ Max download size is configurable in Tabby Settings → MCP → SFTP.`,
                     }
 
                     // Check remote file size
-                    let remoteStats;
+                    let remoteStats: any;
                     try {
                         remoteStats = await sftp.stat(params.remotePath);
                     } catch (error: any) {
@@ -1549,6 +1569,9 @@ class StreamFileUpload {
     isComplete(): boolean { return this.position >= this.size; }
     isCancelled(): boolean { return this.cancelled; }
 
+    // Required by Tabby's FileUpload contract (called on transfer errors).
+    setStatus(_status: string): void { /* progress is tracked via onProgress */ }
+
     cancel(): void {
         this.cancelled = true;
         this.close();
@@ -1628,6 +1651,9 @@ class StreamFileDownload {
     getCompletedBytes(): number { return this.bytesReceived; }
     isComplete(): boolean { return this.bytesReceived >= this.expectedSize; }
     isCancelled(): boolean { return this.cancelled; }
+
+    // Required by Tabby's FileDownload contract (called on transfer errors).
+    setStatus(_status: string): void { /* progress is tracked via onProgress */ }
 
     cancel(): void {
         this.cancelled = true;

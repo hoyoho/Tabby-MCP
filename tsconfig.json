@@ -7,6 +7,18 @@
             "DOM"
         ],
         "moduleResolution": "node",
+        "baseUrl": ".",
+        "paths": {
+            "tabby-core": ["../tabby/tabby-core/typings/index.d.ts"],
+            "tabby-terminal": ["../tabby/tabby-terminal/typings/index.d.ts"],
+            "tabby-settings": ["../tabby/tabby-settings/typings/index.d.ts"],
+            "tabby-ssh": ["../tabby/tabby-ssh/typings/index.d.ts"],
+            "@angular/*": ["../tabby/node_modules/@angular/*"],
+            "@ng-bootstrap/*": ["../tabby/node_modules/@ng-bootstrap/*"],
+            "rxjs": ["../tabby/node_modules/rxjs"],
+            "rxjs/*": ["../tabby/node_modules/rxjs/*"],
+            "@xterm/*": ["../tabby/tabby-terminal/node_modules/@xterm/*"]
+        },
         "declaration": true,
         "declarationDir": "./typings",
         "outDir": "./dist",

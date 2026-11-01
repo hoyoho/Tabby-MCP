@@ -1,5 +1,5 @@
 import { Injectable } from '@angular/core';
-import { AppService, BaseTabComponent, ConfigService, SplitTabComponent } from 'tabby-core';
+import { AppService, BaseTabComponent, ConfigService, SplitTabComponent as SplitTabComponentClass } from 'tabby-core';
 import { BaseTerminalTabComponent, XTermFrontend } from 'tabby-terminal';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import stripAnsi from 'strip-ansi';
@@ -11,6 +11,12 @@ import { McpLoggerService } from '../services/mcpLogger.service';
 import { DialogService } from '../services/dialog.service';
 import { McpTool, ActiveCommand, CommandResult, EnhancedTerminalSession, SessionLocator } from '../types/types';
 
+// Newer Tabby forks export SplitTabComponent as a value alias of the
+// workspace component rather than a class. Keep both a runtime value (for
+// `instanceof`) and a usable instance type (for casts/annotations).
+const SplitTabComponent = SplitTabComponentClass;
+type SplitTabComponent = InstanceType<typeof SplitTabComponentClass>;
+
 /**
  * Terminal session with stable ID for tracking
  * Enhanced to support split pane identification
@@ -19,7 +25,7 @@ export interface TerminalSessionWithTab {
     sessionId: string;        // Stable UUID (unique per pane)
     tabIndex: number;         // Global index across all panes
     tabParent: BaseTabComponent;  // The actual tab (may be SplitTabComponent)
-    tab: BaseTerminalTabComponent;  // The terminal component
+    tab: BaseTerminalTabComponent<any>;  // The terminal component
 
     // Split pane information
     isSplit: boolean;         // Is this pane inside a SplitTabComponent?
@@ -38,7 +44,7 @@ export class TerminalToolCategory extends BaseToolCategory {
     name = 'terminal';
 
     // Session registry for stable IDs (UUID per tab)
-    private tabToSessionId = new WeakMap<BaseTerminalTabComponent, string>();
+    private tabToSessionId = new WeakMap<BaseTerminalTabComponent<any>, string>();
 
     // Active commands tracked by sessionId
     private _activeCommands = new Map<string, ActiveCommand>();
@@ -81,7 +87,7 @@ export class TerminalToolCategory extends BaseToolCategory {
      * Get or create a stable session ID for a tab
      * Made public for cross-category access (e.g., from TabManagementToolCategory)
      */
-    public getOrCreateSessionId(tab: BaseTerminalTabComponent): string {
+    public getOrCreateSessionId(tab: BaseTerminalTabComponent<any>): string {
         let sessionId = this.tabToSessionId.get(tab);
         if (!sessionId) {
             sessionId = randomUUID();
@@ -315,6 +321,21 @@ export class TerminalToolCategory extends BaseToolCategory {
         return (session.tab as any).activeKIPrompt ?? null;
     }
 
+    /**
+     * Read the shell-reported CWD across Tabby versions. Stock Tabby exposed
+     * `session.cwd` (synchronously resolved); newer forks replaced it with
+     * `getCachedWorkingDirectory()`.
+     */
+    private getSessionCwd(session: any): string | undefined {
+        if (!session) {
+            return undefined;
+        }
+        if (typeof session.getCachedWorkingDirectory === 'function') {
+            return session.getCachedWorkingDirectory() ?? undefined;
+        }
+        return session.cwd;
+    }
+
     private describeKeyboardInteractivePrompt(prompt: any): any | undefined {
         if (!prompt) {
             return undefined;
@@ -393,7 +414,7 @@ For split panes:
                             type: tabAny.profile.type
                         } : undefined,
                         pid: tabAny.session?.pty?.pid,
-                        cwd: tabAny.session?.cwd,
+                        cwd: this.getSessionCwd(tabAny.session),
                         // Split pane information
                         isSplit: s.isSplit,
                         splitTabIndex: s.splitTabIndex,
@@ -1148,7 +1169,7 @@ Session targeting: sessionId (recommended) > tabIndex > title > profileName`,
                             isShell,
                             lastPrompt: promptRaw,
                             normalizedPrompt: promptClean || undefined,
-                            cwd: tabAny.session?.cwd,
+                            cwd: this.getSessionCwd(tabAny.session),
                             pid: tabAny.session?.pty?.pid,
                             profile
                         }, null, 2)
@@ -1423,7 +1444,7 @@ After focusing, commands sent to that split tab will go to the focused pane.`,
                     sessionId,
                     tabIndex: globalIndex++,
                     tabParent: tab,
-                    tab: tab as BaseTerminalTabComponent,
+                    tab: tab as BaseTerminalTabComponent<any>,
                     isSplit: false
                 });
             } else if (tab instanceof SplitTabComponent) {
@@ -1431,13 +1452,13 @@ After focusing, commands sent to that split tab will go to the focused pane.`,
                 const splitTab = tab as SplitTabComponent;
                 const childTabs = splitTab.getAllTabs().filter(
                     (childTab: BaseTabComponent) => childTab instanceof BaseTerminalTabComponent &&
-                        (childTab as BaseTerminalTabComponent).frontend !== undefined
+                        (childTab as BaseTerminalTabComponent<any>).frontend !== undefined
                 );
                 const focusedTab = splitTab.getFocusedTab();
                 const totalPanes = childTabs.length;
 
                 childTabs.forEach((childTab: BaseTabComponent, paneIdx: number) => {
-                    const termTab = childTab as BaseTerminalTabComponent;
+                    const termTab = childTab as BaseTerminalTabComponent<any>;
                     const sessionId = this.getOrCreateSessionId(termTab);
                     sessions.push({
                         sessionId,
@@ -1467,20 +1488,35 @@ After focusing, commands sent to that split tab will go to the focused pane.`,
                 return '';
             }
 
-            // Access xterm through type assertion since it may be private
+            // Prefer the host frontend's serializer. It reuses the frontend's
+            // own addon, avoiding cross-bundle `instanceof` failures when the
+            // plugin bundles its own copy of @xterm/addon-serialize.
+            if (typeof (frontend as any).saveState === 'function') {
+                const state = (frontend as any).saveState();
+                if (state) {
+                    // TUIs (vim, less, opencode, ...) draw on the alternate
+                    // screen; that's what the user actually sees, so prefer it.
+                    if (typeof state.alternate === 'string' && state.alternate.length > 0) {
+                        return state.alternate;
+                    }
+                    if (typeof state.primary === 'string') {
+                        return state.primary;
+                    }
+                }
+            }
+
+            // Fallback for stock Tabby: serialize through a cached addon kept
+            // on the xterm instance (never duplicated per call).
             const xtermInstance = (frontend as any).xterm;
             if (!xtermInstance) {
                 return '';
             }
 
-            // Check if serialize addon is already registered
-            let serializeAddon = (xtermInstance as any)._addonManager?._addons?.find(
-                (addon: any) => addon.instance instanceof SerializeAddon
-            )?.instance;
-
+            let serializeAddon = (xtermInstance as any).__tabbyMcpSerializeAddon;
             if (!serializeAddon) {
                 serializeAddon = new SerializeAddon();
                 xtermInstance.loadAddon(serializeAddon);
+                (xtermInstance as any).__tabbyMcpSerializeAddon = serializeAddon;
             }
 
             return serializeAddon.serialize();

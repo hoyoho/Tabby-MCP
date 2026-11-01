@@ -1,11 +1,17 @@
 import { Injectable, Inject, forwardRef } from '@angular/core';
-import { AppService, BaseTabComponent, ConfigService, SplitTabComponent, ProfilesService } from 'tabby-core';
+import { AppService, BaseTabComponent, ConfigService, SplitTabComponent as SplitTabComponentClass, ProfilesService, QuickConnectProfileProvider } from 'tabby-core';
 import { BaseTerminalTabComponent } from 'tabby-terminal';
 import { z } from 'zod';
 import { BaseToolCategory } from './base-tool-category';
 import { McpLoggerService } from '../services/mcpLogger.service';
 import { McpTool } from '../types/types';
 import { TerminalToolCategory } from './terminal';
+
+// Newer Tabby forks export SplitTabComponent as a value alias of the
+// workspace component rather than a class. Keep both a runtime value (for
+// `instanceof`) and a usable instance type (for casts/annotations).
+const SplitTabComponent = SplitTabComponentClass;
+type SplitTabComponent = InstanceType<typeof SplitTabComponentClass>;
 
 /**
  * Tab Management Tools Category - Comprehensive tab and profile management
@@ -46,6 +52,22 @@ export class TabManagementToolCategory extends BaseToolCategory {
 
         // Split pane operations
         this.registerTool(this.createSplitTabTool());
+
+        // Cross-workspace pane move
+        this.registerTool(this.createMovePaneToWorkspaceTool());
+
+        // Extended tab / workspace management
+        this.registerTool(this.createRenameWorkspaceTool());
+        this.registerTool(this.createRenameSessionTool());
+        this.registerTool(this.createMoveTabToIndexTool());
+        this.registerTool(this.createMoveSessionToIndexTool());
+        this.registerTool(this.createDuplicateWorkspaceTool());
+        this.registerTool(this.createDuplicateSessionTool());
+        this.registerTool(this.createCreateWorkspaceTool());
+        this.registerTool(this.createCloseSessionTool());
+        this.registerTool(this.createTogglePinTool());
+        this.registerTool(this.createSetWorkspaceColorTool());
+        this.registerTool(this.createToggleFocusAllTool());
 
         this.logger.info('Tab management tools initialized');
     }
@@ -152,7 +174,9 @@ export class TabManagementToolCategory extends BaseToolCategory {
     }
 
     private getQuickConnectProviders(): any[] {
-        return this.profilesService.getProviders().filter(provider => provider.supportsQuickConnect);
+        // Stock Tabby marked some providers with `supportsQuickConnect`;
+        // forks expose the base class instead. `instanceof` covers both.
+        return this.profilesService.getProviders().filter(provider => provider instanceof QuickConnectProfileProvider);
     }
 
     private getQuickConnectProvider(providerId: string): any | null {
@@ -997,7 +1021,453 @@ Examples:
         };
     }
 
+    // ============= Extended Tab / Workspace Management =============
+
+    private okResp (data: any): any {
+        return { content: [{ type: 'text', text: JSON.stringify(data) }] };
+    }
+
+    private errResp (error: string, hint?: string): any {
+        return { content: [{ type: 'text', text: JSON.stringify({ success: false, error, hint }) }] };
+    }
+
+    private createRenameWorkspaceTool(): McpTool {
+        return {
+            name: 'rename_workspace',
+            description: 'Rename a top-level workspace/tab. Pass an empty name to restore the automatic title.',
+            schema: z.object({
+                tabId: z.string().optional().describe('Stable tab ID (recommended)'),
+                tabIndex: z.number().optional().describe('Index from list_tabs'),
+                title: z.string().optional().describe('Current title (partial match)'),
+                name: z.string().describe('New name; empty string clears the custom title'),
+            }),
+            handler: async (params: { tabId?: string; tabIndex?: number; title?: string; name: string }) => {
+                const tab = this.findTabByLocator({ tabId: params.tabId, tabIndex: params.tabIndex, title: params.title });
+                if (!tab) {
+                    return this.errResp('No matching tab found');
+                }
+                (tab as any).customTitle = params.name;
+                if (params.name) {
+                    (tab as any).setTitle?.(params.name);
+                } else {
+                    (tab as any).updateTitle?.();
+                }
+                this.app.emitTabsChanged();
+                return this.okResp({ success: true, tabId: this.getOrCreateTabId(tab), name: params.name });
+            }
+        };
+    }
+
+    private createRenameSessionTool(): McpTool {
+        return {
+            name: 'rename_session',
+            description: 'Rename a session tab (a pane/tab inside a workspace). Empty name clears the custom title.',
+            schema: z.object({
+                sessionId: z.string().optional().describe('Stable session ID (recommended)'),
+                tabIndex: z.number().optional().describe('Session index from get_session_list (NOT the workspace index)'),
+                title: z.string().optional().describe('Current title (partial match)'),
+                profileName: z.string().optional().describe('Match by profile name'),
+                name: z.string().describe('New name; empty string clears the custom title'),
+            }),
+            handler: async (params: { sessionId?: string; tabIndex?: number; title?: string; profileName?: string; name: string }) => {
+                const session = this.terminalTools.findSessionByLocator({
+                    sessionId: params.sessionId, tabIndex: params.tabIndex, title: params.title, profileName: params.profileName,
+                });
+                if (!session) {
+                    return this.errResp('No matching session found');
+                }
+                (session.tab as any).customTitle = params.name;
+                const workspace: any = this.app.getParentTab(session.tab);
+                workspace?.updateTitle?.();
+                this.app.emitTabsChanged();
+                return this.okResp({ success: true, sessionId: session.sessionId, name: params.name });
+            }
+        };
+    }
+
+    private createMoveTabToIndexTool(): McpTool {
+        return {
+            name: 'move_tab_to_index',
+            description: 'Move a top-level workspace/tab to an absolute position in the tab bar (pinned tabs stay in the pinned range).',
+            schema: z.object({
+                tabId: z.string().optional().describe('Stable tab ID (recommended)'),
+                tabIndex: z.number().optional().describe('Current index from list_tabs'),
+                title: z.string().optional().describe('Current title (partial match)'),
+                toIndex: z.number().describe('Target index in the tab bar (0-based)'),
+            }),
+            handler: async (params: { tabId?: string; tabIndex?: number; title?: string; toIndex: number }) => {
+                const tab = this.findTabByLocator({ tabId: params.tabId, tabIndex: params.tabIndex, title: params.title });
+                if (!tab) {
+                    return this.errResp('No matching tab found');
+                }
+                this.app.moveTabToIndex(tab, params.toIndex);
+                return this.okResp({ success: true, tabId: this.getOrCreateTabId(tab), newIndex: this.app.tabs.indexOf(tab) });
+            }
+        };
+    }
+
+    private createMoveSessionToIndexTool(): McpTool {
+        return {
+            name: 'move_session_to_index',
+            description: 'Reorder a session tab within its pane\'s tab strip (does not move it to another pane/workspace).',
+            schema: z.object({
+                sessionId: z.string().optional().describe('Stable session ID (recommended)'),
+                tabIndex: z.number().optional().describe('Session index from get_session_list'),
+                title: z.string().optional().describe('Current title (partial match)'),
+                profileName: z.string().optional().describe('Match by profile name'),
+                position: z.number().describe('Target position within the pane tab strip (0-based)'),
+            }),
+            handler: async (params: { sessionId?: string; tabIndex?: number; title?: string; profileName?: string; position: number }) => {
+                const session = this.terminalTools.findSessionByLocator({
+                    sessionId: params.sessionId, tabIndex: params.tabIndex, title: params.title, profileName: params.profileName,
+                });
+                if (!session) {
+                    return this.errResp('No matching session found');
+                }
+                const tab: any = session.tab;
+                const workspace: any = this.app.getParentTab(tab);
+                const pane: any = workspace?.getPaneOf?.(tab);
+                if (!pane || !Array.isArray(pane.tabs)) {
+                    return this.errResp('Session is not inside a pane');
+                }
+                const from = pane.tabs.indexOf(tab);
+                const to = Math.max(0, Math.min(params.position, pane.tabs.length - 1));
+                pane.tabs.splice(from, 1);
+                pane.tabs.splice(to, 0, tab);
+                pane.activeTab = tab;
+                workspace.focus?.(tab);
+                workspace.layout?.();
+                workspace.updateTitle?.();
+                this.app.emitTabsChanged();
+                return this.okResp({ success: true, sessionId: session.sessionId, position: to });
+            }
+        };
+    }
+
+    private createDuplicateWorkspaceTool(): McpTool {
+        return {
+            name: 'duplicate_workspace',
+            description: 'Duplicate a whole workspace (all panes) as a new top-level tab.',
+            schema: z.object({
+                tabId: z.string().optional().describe('Stable tab ID (recommended)'),
+                tabIndex: z.number().optional().describe('Index from list_tabs (default: active)'),
+                title: z.string().optional().describe('Current title (partial match)'),
+            }),
+            handler: async (params: { tabId?: string; tabIndex?: number; title?: string }) => {
+                const tab = (params.tabId || params.tabIndex !== undefined || params.title)
+                    ? this.findTabByLocator({ tabId: params.tabId, tabIndex: params.tabIndex, title: params.title })
+                    : this.app.activeTab;
+                if (!tab || !(tab instanceof SplitTabComponent)) {
+                    return this.errResp('Target is not a workspace');
+                }
+                const dup = await this.app.duplicateTab(tab);
+                if (!dup) {
+                    return this.errResp('Failed to duplicate workspace');
+                }
+                return this.okResp({ success: true, tabId: this.getOrCreateTabId(dup), newIndex: this.app.tabs.indexOf(dup) });
+            }
+        };
+    }
+
+    private createDuplicateSessionTool(): McpTool {
+        return {
+            name: 'duplicate_session',
+            description: 'Duplicate a session (pane/tab) inside its own workspace, keeping the copy in the same pane.',
+            schema: z.object({
+                sessionId: z.string().optional().describe('Stable session ID (recommended)'),
+                tabIndex: z.number().optional().describe('Session index from get_session_list'),
+                title: z.string().optional().describe('Current title (partial match)'),
+                profileName: z.string().optional().describe('Match by profile name'),
+            }),
+            handler: async (params: { sessionId?: string; tabIndex?: number; title?: string; profileName?: string }) => {
+                const session = this.terminalTools.findSessionByLocator({
+                    sessionId: params.sessionId, tabIndex: params.tabIndex, title: params.title, profileName: params.profileName,
+                });
+                if (!session) {
+                    return this.errResp('No matching session found');
+                }
+                const workspace: any = this.app.getParentTab(session.tab);
+                if (typeof workspace?.duplicateSession !== 'function') {
+                    return this.errResp('Workspace does not support duplicating sessions');
+                }
+                const dup: any = await workspace.duplicateSession(session.tab);
+                if (!dup) {
+                    return this.errResp('Failed to duplicate session');
+                }
+                return this.okResp({
+                    success: true,
+                    sourceSessionId: session.sessionId,
+                    sessionId: this.terminalTools.getOrCreateSessionId(dup),
+                });
+            }
+        };
+    }
+
+    private createCreateWorkspaceTool(): McpTool {
+        return {
+            name: 'create_workspace',
+            description: 'Create a new empty workspace (a top-level tab that can host panes).',
+            schema: z.object({}),
+            handler: async () => {
+                const workspace: any = (this.app as any).createWorkspaceTab();
+                if (!workspace) {
+                    return this.errResp('Failed to create workspace');
+                }
+                return this.okResp({ success: true, tabId: this.getOrCreateTabId(workspace), tabIndex: this.app.tabs.indexOf(workspace) });
+            }
+        };
+    }
+
+    private createCloseSessionTool(): McpTool {
+        return {
+            name: 'close_session',
+            description: 'Close a single session (pane/tab) without closing the whole workspace. The workspace closes if it was the last pane.',
+            schema: z.object({
+                sessionId: z.string().optional().describe('Stable session ID (recommended)'),
+                tabIndex: z.number().optional().describe('Session index from get_session_list'),
+                title: z.string().optional().describe('Current title (partial match)'),
+                profileName: z.string().optional().describe('Match by profile name'),
+                force: z.boolean().optional().describe('Skip the running-process check (default: false)'),
+            }),
+            handler: async (params: { sessionId?: string; tabIndex?: number; title?: string; profileName?: string; force?: boolean }) => {
+                const session = this.terminalTools.findSessionByLocator({
+                    sessionId: params.sessionId, tabIndex: params.tabIndex, title: params.title, profileName: params.profileName,
+                });
+                if (!session) {
+                    return this.errResp('No matching session found');
+                }
+                const tab: any = session.tab;
+                if (!params.force && typeof tab.canClose === 'function') {
+                    const canClose = await tab.canClose();
+                    if (!canClose) {
+                        return this.errResp('Session refused to close (running process)', 'Pass force=true to override');
+                    }
+                }
+                await tab.destroy?.();
+                return this.okResp({ success: true, sessionId: session.sessionId });
+            }
+        };
+    }
+
+    private createTogglePinTool(): McpTool {
+        return {
+            name: 'toggle_pin',
+            description: 'Pin or unpin a top-level workspace/tab.',
+            schema: z.object({
+                tabId: z.string().optional().describe('Stable tab ID (recommended)'),
+                tabIndex: z.number().optional().describe('Index from list_tabs (default: active)'),
+                title: z.string().optional().describe('Current title (partial match)'),
+            }),
+            handler: async (params: { tabId?: string; tabIndex?: number; title?: string }) => {
+                const tab = (params.tabId || params.tabIndex !== undefined || params.title)
+                    ? this.findTabByLocator({ tabId: params.tabId, tabIndex: params.tabIndex, title: params.title })
+                    : this.app.activeTab;
+                if (!tab) {
+                    return this.errResp('No matching tab found');
+                }
+                this.app.toggleTabPinned(tab);
+                return this.okResp({ success: true, tabId: this.getOrCreateTabId(tab), pinned: tab.pinned });
+            }
+        };
+    }
+
+    private createSetWorkspaceColorTool(): McpTool {
+        return {
+            name: 'set_workspace_color',
+            description: 'Set or clear a top-level workspace/tab color. Pass null/empty to clear.',
+            schema: z.object({
+                tabId: z.string().optional().describe('Stable tab ID (recommended)'),
+                tabIndex: z.number().optional().describe('Index from list_tabs (default: active)'),
+                title: z.string().optional().describe('Current title (partial match)'),
+                color: z.string().nullable().optional().describe('CSS color, e.g. "#e11d48"; null/empty clears'),
+            }),
+            handler: async (params: { tabId?: string; tabIndex?: number; title?: string; color?: string | null }) => {
+                const tab = (params.tabId || params.tabIndex !== undefined || params.title)
+                    ? this.findTabByLocator({ tabId: params.tabId, tabIndex: params.tabIndex, title: params.title })
+                    : this.app.activeTab;
+                if (!tab) {
+                    return this.errResp('No matching tab found');
+                }
+                (tab as any).color = params.color || null;
+                this.app.emitTabsChanged();
+                return this.okResp({ success: true, tabId: this.getOrCreateTabId(tab), color: (tab as any).color });
+            }
+        };
+    }
+
+    private createToggleFocusAllTool(): McpTool {
+        return {
+            name: 'toggle_focus_all',
+            description: 'Toggle "focus all sessions" (broadcast input to every pane) for a workspace.',
+            schema: z.object({
+                tabId: z.string().optional().describe('Stable tab ID (recommended)'),
+                tabIndex: z.number().optional().describe('Index from list_tabs (default: active)'),
+                title: z.string().optional().describe('Current title (partial match)'),
+            }),
+            handler: async (params: { tabId?: string; tabIndex?: number; title?: string }) => {
+                const tab = (params.tabId || params.tabIndex !== undefined || params.title)
+                    ? this.findTabByLocator({ tabId: params.tabId, tabIndex: params.tabIndex, title: params.title })
+                    : this.app.activeTab;
+                if (!tab || !(tab instanceof SplitTabComponent) || typeof (tab as any).toggleFocusAll !== 'function') {
+                    return this.errResp('Target is not a workspace');
+                }
+                (tab as any).toggleFocusAll();
+                return this.okResp({ success: true, tabId: this.getOrCreateTabId(tab), focusAllMode: (tab as any).focusAllMode });
+            }
+        };
+    }
+
+    // ============= Cross-workspace Move =============
+
+    /**
+     * Move a terminal session (pane/tab) from its current workspace into
+     * another workspace in the same window.
+     */
+    private createMovePaneToWorkspaceTool(): McpTool {
+        return {
+            name: 'move_pane_to_workspace',
+            description: `Move a terminal session (pane or tab) into another workspace.
+
+Source: sessionId (recommended) > tabIndex (from get_session_list) > title > profileName
+Target workspace: targetWorkspaceIndex (from list_tabs) or targetWorkspaceTitle (partial match)
+Placement:
+- mode='pane' (default): creates a NEW pane in the target workspace at 'side'
+- mode='tab': merges the session into the target workspace's focused pane as a tab
+Optional targetSessionId: place the new pane relative to that session in the target workspace
+
+The moved session keeps running (same process). If the source workspace becomes empty it is closed.`,
+            schema: z.object({
+                sessionId: z.string().optional().describe('Stable session ID of the session to move'),
+                tabIndex: z.number().optional().describe('Session index from get_session_list'),
+                title: z.string().optional().describe('Match source session by title'),
+                profileName: z.string().optional().describe('Match source session by profile name'),
+                targetWorkspaceIndex: z.number().optional().describe('Target workspace index from list_tabs'),
+                targetWorkspaceTitle: z.string().optional().describe('Target workspace title (partial match)'),
+                targetSessionId: z.string().optional().describe('Place relative to this session in the target workspace'),
+                mode: z.enum(['pane', 'tab']).optional().describe("'pane' = new split (default), 'tab' = merge into focused pane"),
+                side: z.enum(['r', 'l', 't', 'b', 'right', 'left', 'top', 'bottom']).optional().describe('Split side for mode=pane (default: r)'),
+            }),
+            handler: async (params: {
+                sessionId?: string;
+                tabIndex?: number;
+                title?: string;
+                profileName?: string;
+                targetWorkspaceIndex?: number;
+                targetWorkspaceTitle?: string;
+                targetSessionId?: string;
+                mode?: 'pane' | 'tab';
+                side?: string;
+            }) => {
+                const session = this.terminalTools.findSessionByLocator({
+                    sessionId: params.sessionId,
+                    tabIndex: params.tabIndex,
+                    title: params.title,
+                    profileName: params.profileName,
+                });
+                if (!session) {
+                    return {
+                        content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'No matching source session found', hint: 'Use get_session_list to see sessions' }) }]
+                    };
+                }
+
+                const sourceTab: any = session.tab;
+                const sourceWorkspace: any = this.app.getParentTab(sourceTab);
+                if (!sourceWorkspace || typeof sourceWorkspace.removeTab !== 'function') {
+                    return {
+                        content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Source session is not inside a workspace' }) }]
+                    };
+                }
+
+                let targetWorkspace: any = null;
+                if (params.targetWorkspaceIndex !== undefined) {
+                    targetWorkspace = this.app.tabs[params.targetWorkspaceIndex] ?? null;
+                } else if (params.targetWorkspaceTitle) {
+                    const needle = params.targetWorkspaceTitle.toLowerCase();
+                    targetWorkspace = this.app.tabs.find(tab => (tab.title ?? '').toLowerCase().includes(needle)) ?? null;
+                }
+                if (!targetWorkspace || typeof targetWorkspace.addTabAt !== 'function') {
+                    return {
+                        content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Target workspace not found', hint: 'Pass targetWorkspaceIndex from list_tabs; only workspace tabs can receive panes' }) }]
+                    };
+                }
+                if (targetWorkspace === sourceWorkspace) {
+                    return {
+                        content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Source and target are the same workspace' }) }]
+                    };
+                }
+
+                const sideMap: Record<string, 'r' | 'l' | 't' | 'b'> = {
+                    r: 'r', right: 'r', l: 'l', left: 'l', t: 't', top: 't', b: 'b', bottom: 'b',
+                };
+                const side = sideMap[params.side ?? 'r'] ?? 'r';
+                const mode = params.mode ?? 'pane';
+
+                let relative: any = null;
+                if (params.targetSessionId) {
+                    const targetSession = this.terminalTools.findSessionByLocator({ sessionId: params.targetSessionId });
+                    relative = targetSession?.tab ?? null;
+                }
+                if (!relative) {
+                    relative = targetWorkspace.getFocusedTab?.() ?? targetWorkspace.getAllTabs?.()[0] ?? null;
+                }
+
+                const fromTitle = sourceWorkspace.title;
+                const toTitle = targetWorkspace.title;
+
+                try {
+                    // The target workspace's view container only exists once its
+                    // view has been initialized; select it first and wait.
+                    this.app.selectTab(targetWorkspace);
+                    if (!targetWorkspace.viewContainer) {
+                        await targetWorkspace.initialized$?.toPromise?.();
+                    }
+
+                    if (mode === 'tab' && typeof targetWorkspace.addTabToPane === 'function') {
+                        // addTabToPane() adopts the session, detaching it from
+                        // its previous workspace.
+                        await targetWorkspace.addTabToPane(sourceTab);
+                    } else {
+                        sourceWorkspace.removeTab(sourceTab);
+                        await targetWorkspace.addTabAt(sourceTab, relative, side);
+                    }
+
+                    targetWorkspace.focus?.(sourceTab);
+                    this.app.selectTab(targetWorkspace);
+
+                    this.logger.info(`Moved session ${session.sessionId} from "${fromTitle}" to "${toTitle}" (${mode}, ${side})`);
+                    return {
+                        content: [{ type: 'text', text: JSON.stringify({
+                            success: true,
+                            sessionId: session.sessionId,
+                            from: fromTitle,
+                            to: toTitle,
+                            mode,
+                            side: mode === 'pane' ? side : undefined,
+                            paneCount: this.countPanes(targetWorkspace),
+                        }) }]
+                    };
+                } catch (error: any) {
+                    this.logger.error('Error moving pane between workspaces:', error);
+                    return {
+                        content: [{ type: 'text', text: JSON.stringify({ success: false, error: error.message || 'Failed to move pane' }) }]
+                    };
+                }
+            }
+        };
+    }
+
     // ============= Split Pane Operations =============
+
+    /**
+     * Count real panes, not tabs: a pane may host several background tabs.
+     */
+    private countPanes (workspace: any): number {
+        const foreground = workspace?.getForegroundTabs?.();
+        if (Array.isArray(foreground)) {
+            return foreground.length;
+        }
+        return workspace?.getAllTabs?.().length ?? 0;
+    }
 
     private createSplitTabTool(): McpTool {
         return {
@@ -1057,9 +1527,18 @@ The active tab must be inside a SplitTabComponent, or be a terminal that can be 
                     if (activeTab instanceof SplitTabComponent) {
                         // Active tab IS a SplitTabComponent - split the focused pane
                         const splitTab = activeTab as SplitTabComponent;
-                        const focusedPane = splitTab.getFocusedTab();
+                        // A freshly duplicated/restored workspace may not have a
+                        // focused pane yet; fall back to its first session so
+                        // splitting still creates a real pane.
+                        const focusedPane = splitTab.getFocusedTab() ?? splitTab.getAllTabs()[0] ?? null;
 
                         if (focusedPane) {
+                            // Mirror the manual split hotkey: split relative to
+                            // the focused session, so the new pane lands next to
+                            // the pane the user is actually looking at.
+                            if (typeof (splitTab as any).focus === 'function') {
+                                (splitTab as any).focus(focusedPane);
+                            }
                             const newTab = await (splitTab as any).splitTab(focusedPane, splitDir);
                             if (newTab) {
                                 this.logger.info(`Split pane ${splitDir} in SplitTabComponent`);
@@ -1069,7 +1548,7 @@ The active tab must be inside a SplitTabComponent, or be a terminal that can be 
                                             success: true,
                                             direction: direction,
                                             message: `Created split pane to the ${positionLabel}`,
-                                            paneCount: splitTab.getAllTabs().length
+                                            paneCount: this.countPanes(splitTab)
                                         })
                                     }]
                                 };
@@ -1090,7 +1569,7 @@ The active tab must be inside a SplitTabComponent, or be a terminal that can be 
                                         success: true,
                                         direction: direction,
                                         message: `Created split pane to the ${positionLabel}`,
-                                        paneCount: splitTab.getAllTabs().length
+                                        paneCount: this.countPanes(splitTab)
                                     })
                                 }]
                             };
